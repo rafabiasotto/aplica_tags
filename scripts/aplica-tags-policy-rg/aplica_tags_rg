@@ -1,0 +1,183 @@
+# SCRIPT POWERSHELL PARA APLICAR TAGS E POLICY ASSIGNMENTS COM AZ CLI
+
+# Variável que armazena o caminho do executável az
+$AZ = "az"
+
+# Função para executar comandos e capturar erros de forma elegante
+function Invoke-Az {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Command
+    )
+
+    $CommandString = "$AZ " + ($Command -join " ")
+    Write-Host "Executando: $CommandString" -ForegroundColor DarkGray
+
+    & $AZ @Command
+    $ExitCode = $LASTEXITCODE
+
+    if ($ExitCode -ne 0) {
+        Write-Error "❌ ERRO FATAL para comando: $CommandString (ExitCode = $ExitCode)"
+        return $null
+    }
+
+    return $true
+}
+
+# ------------------------------------------------------------
+
+## 1. Seleção da Assinatura
+
+Write-Host "`n🔍 Lendo assinaturas do tenant...`n" -ForegroundColor Cyan
+
+try {
+    $SubsOutput = & $AZ account list | Out-String
+    if (-not $SubsOutput) { throw "Falha crítica ao listar assinaturas." }
+    $Subs = $SubsOutput | ConvertFrom-Json
+} catch {
+    Write-Error "❌ ERRO ao ler assinaturas. Verifique o AZ CLI."
+    exit 1
+}
+
+Write-Host "Selecione uma assinatura:"
+$counter = 1
+$Subs | ForEach-Object {
+    Write-Host "$counter. $($_.name) ($($_.id))"
+    $counter++
+}
+
+[int]$Selection = Read-Host "`nDigite o número da assinatura"
+if ($Selection -lt 1 -or $Selection -gt $Subs.Count) {
+    Write-Error "❌ Seleção inválida."
+    exit 1
+}
+
+$Subscription = $Subs[$Selection - 1]
+$SubscriptionId = $Subscription.id
+$SubscriptionName = $Subscription.name
+
+Write-Host "`n🟧 Assinatura selecionada: **$SubscriptionName** ($SubscriptionId)`n" -ForegroundColor Yellow
+
+& $AZ account set --subscription $SubscriptionId
+
+# -----------------------------------------------------------
+
+## 2. Seleção do Resource Group
+
+Write-Host "🔍 Lendo Resource Groups...`n" -ForegroundColor Cyan
+
+try {
+    $RgsOutput = & $AZ group list | Out-String
+    if (-not $RgsOutput) { throw "Falha crítica ao listar RGs." }
+    $Rgs = $RgsOutput | ConvertFrom-Json
+} catch {
+    Write-Error "❌ Falha ao ler RGs."
+    exit 1
+}
+
+Write-Host "Selecione um Resource Group:"
+$counter = 1
+$Rgs | ForEach-Object {
+    Write-Host "$counter. $($_.name) (Local: $($_.location))"
+    $counter++
+}
+
+[int]$RgSelection = Read-Host "`nDigite o número do RG"
+if ($RgSelection -lt 1 -or $RgSelection -gt $Rgs.Count) {
+    Write-Error "❌ Seleção inválida."
+    exit 1
+}
+
+$Rg = $Rgs[$RgSelection - 1]
+$RgName = $Rg.name
+$RgLocation = $Rg.location
+$Scope = "/subscriptions/$SubscriptionId/resourceGroups/$RgName"
+
+Write-Host "`n🟦 RG selecionado: **$RgName** (Localização: $RgLocation)`n" -ForegroundColor Blue
+
+# -----------------------------------------------------------
+
+## 3. Valores das Tags – (ATUALIZADO)
+
+$TagEnvironment  = Read-Host "Valor da tag 'environment'"
+$TagCostCenter   = Read-Host "Valor da tag 'cost-center'"
+$TagApplication  = Read-Host "Valor da tag 'application'"
+$TagOwner        = Read-Host "Valor da tag 'cost-owner'"
+ 
+$Tags = @{
+    "environment" = $TagEnvironment
+    "cost-center" = $TagCostCenter
+    "application" = $TagApplication
+    "cost-owner"  = $TagOwner
+}
+
+Write-Host "`n🚀 Aplicando tags no Resource Group...`n" -ForegroundColor Green
+
+$Tags.GetEnumerator() | ForEach-Object {
+    Write-Host "➡️ Aplicando tag $($_.Key)=$($_.Value)" -ForegroundColor DarkGreen
+    & $AZ group update -n $RgName --set "tags.$($_.Key)=$($_.Value)" | Out-Null
+}
+
+# -----------------------------------------------------------
+
+## 4. Policy Assignments e Remediações
+
+Write-Host "`n🏗 Criando assignments e remediações...`n" -ForegroundColor Yellow
+
+$PolicyId = "cd3aa116-8754-49c9-a813-ad46512ece54"
+$PolicyDisplayName = "Inherit a tag from the resource group if missing"
+
+$Tags.GetEnumerator() | ForEach-Object {
+
+    $Key = $_.Key
+    
+    # AJUSTE DE LIMITE DE CARACTERE:
+    # Usando prefixo curto e limitando o nome do RG para garantir que não passe de 64 caracteres.
+    $ShortRg = if ($RgName.Length -gt 25) { $RgName.Substring(0,25) } else { $RgName }
+    $AssignmentName = "inh-$Key-$ShortRg"
+    $RemediationName = "rem-$Key-$ShortRg"
+
+    Write-Host "`n➡️ Criando assignment '$AssignmentName'..." -ForegroundColor DarkYellow
+
+    # JSON temporário
+    $TempFilePath = Join-Path $PSScriptRoot "$AssignmentName.parameters.json"
+
+    $ParamsObject = @{
+        tagName = @{ value = $Key }
+    }
+
+    $ParamsObject | ConvertTo-Json -Depth 5 -Compress | Out-File $TempFilePath -Encoding UTF8
+
+    # CRIAÇÃO DO ASSIGNMENT
+    $AssignmentOutput = & $AZ policy assignment create `
+        --name $AssignmentName `
+        --display-name "$PolicyDisplayName - $Key" `
+        --scope $Scope `
+        --policy $PolicyId `
+        --params $TempFilePath `
+        --assign-identity `
+        --identity-scope $Scope `
+        --role Contributor `
+        --location $RgLocation | Out-String
+
+    Remove-Item $TempFilePath -Force -ErrorAction SilentlyContinue
+
+    if ($AssignmentOutput) {
+        Write-Host "✅ Assignment criado com sucesso." -ForegroundColor Green
+
+        Write-Host "➡️ Criando remediação para '$Key'..." -ForegroundColor DarkGreen
+
+        & $AZ policy remediation create `
+            --name $RemediationName `
+            --resource-group $RgName `
+            --policy-assignment $AssignmentName `
+            --resource-discovery-mode ReEvaluateCompliance | Out-Null
+
+        Write-Host "✅ Remediação criada." -ForegroundColor Green
+
+    } else {
+        Write-Error "❌ Falha ao criar assignment '$AssignmentName'."
+    }
+}
+
+Write-Host "`n`n✅ FINALIZADO! Tags aplicadas, assignments criados e remediações iniciadas.`n" -ForegroundColor Green
